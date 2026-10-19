@@ -123,7 +123,9 @@ impl KernelBuilder {
 
     pub fn new() -> Self {
         let debug = DEBUG.load(Ordering::Relaxed);
-        let debug = if debug == -1 {
+        let debug = if let Some(config) = GlobalConfig::scoped() {
+            matches!(config.compilation.logger.level, CompilationLogLevel::Full)
+        } else if debug == -1 {
             let val = match GlobalConfig::get().compilation.logger.level {
                 CompilationLogLevel::Full => 1,
                 _ => 0,

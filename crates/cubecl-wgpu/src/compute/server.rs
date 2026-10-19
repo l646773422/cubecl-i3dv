@@ -29,6 +29,8 @@ pub struct WgpuServer {
     stream: WgpuStream,
     pub compilation_options: WgpuCompilationOptions,
     pub(crate) backend: wgpu::Backend,
+    pub(crate) stable_compiler: bool,
+    pub(crate) session_config: Option<Arc<cubecl_runtime::config::GlobalConfig>>,
 }
 
 impl WgpuServer {
@@ -57,6 +59,8 @@ impl WgpuServer {
             pipelines: HashMap::new(),
             stream,
             backend,
+            stable_compiler: false,
+            session_config: None,
         }
     }
 
@@ -73,8 +77,17 @@ impl WgpuServer {
             return pipeline.clone();
         }
 
+        // Host-opted-in CPU timing only; no extra GPU synchronization or shader dumps.
+        let timing = log::log_enabled!(target: "cubecl_wgpu::compile_timing", log::Level::Debug)
+            .then(|| (web_time::Instant::now(), kernel.name()));
         let mut compiler = compiler(self.backend);
-        let mut compile = compiler.compile(self, kernel, mode);
+        let mut compile = if let Some(config) = self.session_config.clone() {
+            cubecl_runtime::config::GlobalConfig::with_scoped(config, || {
+                compiler.compile(self, kernel, mode)
+            })
+        } else {
+            compiler.compile(self, kernel, mode)
+        };
 
         if logger.compilation_activated() {
             compile.debug_info = Some(DebugInformation::new(
@@ -105,7 +118,20 @@ impl WgpuServer {
         //         .expect("should launch the command");
         //     // std::process::exit(status.code().unwrap());
         // }
+        let lowered = timing.as_ref().map(|_| web_time::Instant::now());
+        let source_bytes = timing.as_ref().map(|_| compile.source.len());
         let pipeline = self.create_pipeline(compile, mode);
+        if let (Some((started, name)), Some(lowered)) = (timing, lowered) {
+            let completed = web_time::Instant::now();
+            let owner = std::thread::current();
+            log::debug!(target: "cubecl_wgpu::compile_timing",
+                "[GpuCompile] thread={:?}/{} kernel={} lower_ms={:.3} native_pipeline_ms={:.3} total_ms={:.3} source_bytes={:?}",
+                owner.id(), owner.name().unwrap_or("unnamed"), name,
+                lowered.duration_since(started).as_secs_f64() * 1000.0,
+                completed.duration_since(lowered).as_secs_f64() * 1000.0,
+                completed.duration_since(started).as_secs_f64() * 1000.0, source_bytes,
+            );
+        }
         self.pipelines.insert(kernel_id.clone(), pipeline.clone());
 
         pipeline

@@ -13,12 +13,12 @@
 //!
 //! fn run_kernel_tuned(lhs: Tensor, rhs: Tensor) -> Tensor {
 //!     static TUNER: LocalTuner<String, KernelKey> = local_tuner!();
-//!     
+//!
 //!     let tunables = TunableSet::new(KernelKey::new, |_key, lhs, rhs| (lhs.clone(), rhs.clone()))
 //!         .with_tunable(kernel_1)
 //!         .with_tunable(kernel_2.ok())
 //!         .with_tunable(kernel_3);
-//!    
+//!
 //!     TUNER.execute("hello".to_string(), &lhs.client, &tunables, (lhs, rhs));
 //! }
 //! ```
@@ -58,6 +58,7 @@ mod function_tunable;
 mod input_generator;
 mod key_generator;
 mod local;
+mod session;
 mod operation;
 mod tune_benchmark;
 mod tune_cache;
@@ -68,6 +69,7 @@ pub use function_tunable::*;
 pub use input_generator::*;
 pub use key_generator::*;
 pub use local::*;
+pub use session::*;
 pub use operation::*;
 pub use tune_benchmark::AutotuneOutput;
 pub use tune_benchmark::*;

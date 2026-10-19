@@ -28,7 +28,9 @@ macro_rules! local_tuner {
 
 pub use local_tuner;
 
-impl<AK: AutotuneKey + 'static, ID: Hash + PartialEq + Eq + Clone + Display> LocalTuner<AK, ID> {
+impl<AK: AutotuneKey + 'static, ID: Hash + PartialEq + Eq + Clone + Display + Send + Sync + 'static>
+    LocalTuner<AK, ID>
+{
     /// Create a new local tuner.
     pub const fn new(name: &'static str) -> Self {
         Self {
@@ -70,12 +72,26 @@ impl<AK: AutotuneKey + 'static, ID: Hash + PartialEq + Eq + Clone + Display> Loc
         S: ComputeServer + 'static,
         C: ComputeChannel<S> + 'static,
     {
-        let key = operations.generate_key(&inputs);
+        let session_state;
+        let state_lock = if let Some(session) = client.session_tuning() {
+            session_state =
+                session.state::<spin::RwLock<Option<HashMap<ID, Tuner<AK>>>>>(self.name);
+            &*session_state
+        } else {
+            &self.state
+        };
+        let key = if client.session_tuning().is_some() {
+            super::util::with_session_key(|| operations.generate_key(&inputs))
+        } else {
+            operations.generate_key(&inputs)
+        };
 
         // If this is cached and ready, use the operation.
-        if let Some(map) = self.state.read().as_ref() {
+        if let Some(map) = state_lock.read().as_ref() {
             if let Some(tuner) = map.get(id) {
-                if let TuneCacheResult::Hit { fastest_index } = tuner.fastest(&key) {
+                if let TuneCacheResult::Hit { fastest_index } =
+                    tuner.fastest_for(&key, operations.len())
+                {
                     #[cfg(feature = "autotune-checks")]
                     self.checks(operations, &inputs);
 
@@ -92,22 +108,26 @@ impl<AK: AutotuneKey + 'static, ID: Hash + PartialEq + Eq + Clone + Display> Loc
         // Create the tuner if needed, and update some state like
         // checksums if need be.
         let (fastest, run_autotune) = {
-            let mut state = self.state.write();
+            let mut state = state_lock.write();
             let map = state.get_or_insert_with(Default::default);
             let tuner = map.entry(id.clone()).or_insert_with(move || {
                 let name = self.name.replace("::", "-");
-                Tuner::new(&name, &id.to_string())
+                if let Some(session) = client.session_tuning() {
+                    Tuner::new_for_session(&name, session)
+                } else {
+                    Tuner::new(&name, &id.to_string())
+                }
             });
 
             #[allow(unused_mut)]
-            let mut fastest = tuner.fastest(&key);
+            let mut fastest = tuner.fastest_for(&key, operations.len());
 
             // If the cache checksum hasn't been checked, do so now, and retry.
             #[cfg(std_io)]
             if matches!(fastest, TuneCacheResult::Unchecked) {
                 let checksum = operations.compute_checksum();
                 tuner.validate_checksum(&key, &checksum);
-                fastest = tuner.fastest(&key);
+                fastest = tuner.fastest_for(&key, operations.len());
             }
             let mut run_autotune = false;
 
@@ -143,7 +163,7 @@ impl<AK: AutotuneKey + 'static, ID: Hash + PartialEq + Eq + Clone + Display> Loc
                     //   - tune_2 save
                     // - tune_1 save
                     // ```
-                    let state = self.state.read();
+                    let state = state_lock.read();
                     let tuner = state
                         .as_ref()
                         .and_then(|s| s.get(id))
@@ -162,7 +182,7 @@ impl<AK: AutotuneKey + 'static, ID: Hash + PartialEq + Eq + Clone + Display> Loc
         };
 
         let fastest = {
-            let mut state = self.state.write();
+            let mut state = state_lock.write();
             let tuner = state
                 .as_mut()
                 .and_then(|s| s.get_mut(id))
@@ -172,7 +192,7 @@ impl<AK: AutotuneKey + 'static, ID: Hash + PartialEq + Eq + Clone + Display> Loc
             tuner.handle_results();
 
             // Check again what the fastest option is, new results might have come in.
-            match tuner.fastest(&key) {
+            match tuner.fastest_for(&key, operations.len()) {
                 TuneCacheResult::Hit { fastest_index } => {
                     // Theres a known good value - just run it.
                     fastest_index

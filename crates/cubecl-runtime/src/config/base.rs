@@ -6,6 +6,11 @@ use alloc::sync::Arc;
 /// Static mutex holding the global configuration, initialized as `None`.
 static CUBE_GLOBAL_CONFIG: spin::Mutex<Option<Arc<GlobalConfig>>> = spin::Mutex::new(None);
 
+#[cfg(feature = "std")]
+std::thread_local! {
+    static SCOPED_CONFIG: core::cell::RefCell<Option<Arc<GlobalConfig>>> = const { core::cell::RefCell::new(None) };
+}
+
 /// Represents the global configuration for CubeCL, combining profiling, autotuning, and compilation settings.
 #[derive(Default, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct GlobalConfig {
@@ -23,6 +28,40 @@ pub struct GlobalConfig {
 }
 
 impl GlobalConfig {
+    /// Current synchronous override, if any. Consumers with their own cached
+    /// global flags must consult this before reading or populating those caches.
+    pub fn scoped() -> Option<Arc<Self>> {
+        #[cfg(feature = "std")]
+        {
+            SCOPED_CONFIG.with(|slot| slot.borrow().clone())
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            None
+        }
+    }
+
+    /// Use owned SDK settings for one synchronous kernel-definition operation.
+    /// Restores nested scopes on return or unwind; never mutates the global config.
+    pub fn with_scoped<T>(config: Arc<Self>, operation: impl FnOnce() -> T) -> T {
+        #[cfg(feature = "std")]
+        {
+            struct Restore(Option<Arc<GlobalConfig>>);
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    SCOPED_CONFIG.with(|slot| *slot.borrow_mut() = self.0.take());
+                }
+            }
+            let _restore = Restore(SCOPED_CONFIG.with(|slot| slot.replace(Some(config))));
+            operation()
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            let _ = config;
+            operation()
+        }
+    }
+
     /// Retrieves the current global configuration, loading it from the current directory if not set.
     ///
     /// If no configuration is set, it attempts to load one from `cubecl.toml` or `CubeCL.toml` in the
@@ -40,6 +79,9 @@ impl GlobalConfig {
     /// the [super::autotune::AutotuneLevel] config. All subsequent fetches of the value are
     /// lock-free.
     pub fn get() -> Arc<Self> {
+        if let Some(config) = Self::scoped() {
+            return config;
+        }
         let mut state = CUBE_GLOBAL_CONFIG.lock();
         if state.as_ref().is_none() {
             cfg_if::cfg_if! {

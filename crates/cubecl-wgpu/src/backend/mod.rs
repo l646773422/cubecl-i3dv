@@ -1,4 +1,6 @@
 mod base;
+#[cfg(target_os = "windows")]
+pub(crate) mod compilation_worker;
 mod wgsl;
 
 #[cfg(feature = "spirv")]

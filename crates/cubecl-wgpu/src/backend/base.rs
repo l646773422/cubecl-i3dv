@@ -25,121 +25,125 @@ impl WgpuServer {
         kernel: CompiledKernel<AutoCompiler>,
         mode: ExecutionMode,
     ) -> Arc<ComputePipeline> {
-        let module = match &kernel.repr {
-            #[cfg(feature = "spirv")]
-            Some(AutoRepresentation::SpirV(repr)) => {
-                let spirv = repr.assemble();
-                unsafe {
-                    self.device.create_shader_module_passthrough(
-                        wgpu::ShaderModuleDescriptorPassthrough::SpirV(
-                            wgpu::ShaderModuleDescriptorSpirV {
-                                label: Some(&kernel.entrypoint_name),
-                                source: Cow::Borrowed(&spirv),
-                            },
-                        ),
-                    )
-                }
-            }
-            #[cfg(all(feature = "msl", target_os = "macos"))]
-            Some(AutoRepresentation::Msl(repr)) => {
-                let source = &kernel.source;
-                unsafe {
-                    self.device.create_shader_module_passthrough(
-                        wgpu::ShaderModuleDescriptorPassthrough::Msl(
-                            wgpu::ShaderModuleDescriptorMsl {
-                                entry_point: kernel.entrypoint_name.clone(),
-                                label: Some(&kernel.entrypoint_name),
-                                source: Cow::Borrowed(source),
-                                num_workgroups: (repr.cube_dim.x, repr.cube_dim.y, repr.cube_dim.z),
-                            },
-                        ),
-                    )
-                }
-            }
-            _ => {
-                let source = &kernel.source;
-
-                let checks = wgpu::ShaderRuntimeChecks {
-                    // Cube does not need wgpu bounds checks - OOB behaviour is instead
-                    // checked by cube (if enabled).
-                    // This is because the WebGPU specification only makes loose guarantees that Cube can't rely on.
-                    bounds_checks: false,
-                    // Loop bounds are only checked in checked mode.
-                    force_loop_bounding: mode == ExecutionMode::Checked,
-                };
-
-                // SAFETY: Cube guarantees OOB safety when launching in checked mode. Launching in unchecked mode
-                // is only available through the use of unsafe code.
-                unsafe {
-                    self.device.create_shader_module_trusted(
-                        ShaderModuleDescriptor {
-                            label: None,
-                            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(source)),
-                        },
-                        checks,
-                    )
-                }
-            }
-        };
-        let bindings = match &kernel.repr {
-            Some(AutoRepresentation::Wgsl(repr)) => Some(wgsl::bindings(repr)),
-            #[cfg(all(feature = "msl", target_os = "macos"))]
-            Some(AutoRepresentation::Msl(repr)) => Some(cpp_metal::bindings(repr)),
-            #[cfg(feature = "spirv")]
-            Some(AutoRepresentation::SpirV(repr)) => Some(vulkan::bindings(repr)),
-            _ => None,
-        };
-        let layout = bindings.map(|bindings| {
-            let bindings = bindings
-                .into_iter()
-                .map(|(i, _visibility)| BindGroupLayoutEntry {
-                    binding: i as u32,
-                    visibility: ShaderStages::COMPUTE,
-                    ty: BindingType::Buffer {
-                        #[cfg(not(exclusive_memory_only))]
-                        ty: BufferBindingType::Storage { read_only: false },
-                        #[cfg(exclusive_memory_only)]
-                        ty: BufferBindingType::Storage {
-                            read_only: matches!(
-                                _visibility,
-                                cubecl_core::compute::Visibility::Read
-                            ),
-                        },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                })
-                .collect::<Vec<_>>();
-            let layout = self
-                .device
-                .create_bind_group_layout(&BindGroupLayoutDescriptor {
-                    label: None,
-                    entries: &bindings,
-                });
-            self.device
-                .create_pipeline_layout(&PipelineLayoutDescriptor {
-                    label: None,
-                    bind_group_layouts: &[&layout],
-                    push_constant_ranges: &[],
-                })
-        });
-
-        Arc::new(
-            self.device
-                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some(&kernel.entrypoint_name),
-                    layout: layout.as_ref(),
-                    module: &module,
-                    entry_point: Some(&kernel.entrypoint_name),
-                    compilation_options: wgpu::PipelineCompilationOptions {
-                        zero_initialize_workgroup_memory: false,
-                        ..Default::default()
-                    },
-                    cache: None,
-                }),
-        )
+        #[cfg(target_os = "windows")]
+        if self.stable_compiler {
+            let device = self.device.clone();
+            return super::compilation_worker::run(move || create_pipeline(&device, kernel, mode));
+        }
+        create_pipeline(&self.device, kernel, mode)
     }
+}
+
+fn create_pipeline(
+    device: &Device,
+    kernel: CompiledKernel<AutoCompiler>,
+    mode: ExecutionMode,
+) -> Arc<ComputePipeline> {
+    let module = match &kernel.repr {
+        #[cfg(feature = "spirv")]
+        Some(AutoRepresentation::SpirV(repr)) => {
+            let spirv = repr.assemble();
+            unsafe {
+                device.create_shader_module_passthrough(
+                    wgpu::ShaderModuleDescriptorPassthrough::SpirV(
+                        wgpu::ShaderModuleDescriptorSpirV {
+                            label: Some(&kernel.entrypoint_name),
+                            source: Cow::Borrowed(&spirv),
+                        },
+                    ),
+                )
+            }
+        }
+        #[cfg(all(feature = "msl", target_os = "macos"))]
+        Some(AutoRepresentation::Msl(repr)) => {
+            let source = &kernel.source;
+            unsafe {
+                device.create_shader_module_passthrough(
+                    wgpu::ShaderModuleDescriptorPassthrough::Msl(wgpu::ShaderModuleDescriptorMsl {
+                        entry_point: kernel.entrypoint_name.clone(),
+                        label: Some(&kernel.entrypoint_name),
+                        source: Cow::Borrowed(source),
+                        num_workgroups: (repr.cube_dim.x, repr.cube_dim.y, repr.cube_dim.z),
+                    }),
+                )
+            }
+        }
+        _ => {
+            let source = &kernel.source;
+
+            let checks = wgpu::ShaderRuntimeChecks {
+                // Cube does not need wgpu bounds checks - OOB behaviour is instead
+                // checked by cube (if enabled).
+                // This is because the WebGPU specification only makes loose guarantees that Cube can't rely on.
+                bounds_checks: false,
+                // Loop bounds are only checked in checked mode.
+                force_loop_bounding: mode == ExecutionMode::Checked,
+            };
+
+            // SAFETY: Cube guarantees OOB safety when launching in checked mode. Launching in unchecked mode
+            // is only available through the use of unsafe code.
+            unsafe {
+                device.create_shader_module_trusted(
+                    ShaderModuleDescriptor {
+                        label: None,
+                        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(source)),
+                    },
+                    checks,
+                )
+            }
+        }
+    };
+    let bindings = match &kernel.repr {
+        Some(AutoRepresentation::Wgsl(repr)) => Some(wgsl::bindings(repr)),
+        #[cfg(all(feature = "msl", target_os = "macos"))]
+        Some(AutoRepresentation::Msl(repr)) => Some(cpp_metal::bindings(repr)),
+        #[cfg(feature = "spirv")]
+        Some(AutoRepresentation::SpirV(repr)) => Some(vulkan::bindings(repr)),
+        _ => None,
+    };
+    let layout = bindings.map(|bindings| {
+        let bindings = bindings
+            .into_iter()
+            .map(|(i, _visibility)| BindGroupLayoutEntry {
+                binding: i as u32,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    #[cfg(not(exclusive_memory_only))]
+                    ty: BufferBindingType::Storage { read_only: false },
+                    #[cfg(exclusive_memory_only)]
+                    ty: BufferBindingType::Storage {
+                        read_only: matches!(_visibility, cubecl_core::compute::Visibility::Read),
+                    },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            })
+            .collect::<Vec<_>>();
+        let layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: None,
+            entries: &bindings,
+        });
+        device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[&layout],
+            push_constant_ranges: &[],
+        })
+    });
+
+    Arc::new(
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(&kernel.entrypoint_name),
+            layout: layout.as_ref(),
+            module: &module,
+            entry_point: Some(&kernel.entrypoint_name),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                zero_initialize_workgroup_memory: false,
+                ..Default::default()
+            },
+            cache: None,
+        }),
+    )
 }
 
 #[cfg(all(not(feature = "spirv"), not(feature = "msl")))]

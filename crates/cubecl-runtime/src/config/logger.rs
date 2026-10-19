@@ -115,7 +115,17 @@ impl Logger {
     ///
     /// Note that creating a logger is quite expensive.
     pub fn new() -> Self {
-        let config = GlobalConfig::get();
+        Self::from_config(GlobalConfig::get())
+    }
+
+    /// SDK diagnostics use only the host-installed log facade, never ambient files.
+    pub(crate) fn for_session() -> Self {
+        let mut config = GlobalConfig::default();
+        config.autotune.logger.log = Some(LogCrateLevel::Debug);
+        Self::from_config(Arc::new(config))
+    }
+
+    fn from_config(config: Arc<GlobalConfig>) -> Self {
         let mut loggers = Vec::new();
         let mut compilation_index = Vec::new();
         let mut profiling_index = Vec::new();

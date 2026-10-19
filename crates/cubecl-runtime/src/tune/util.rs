@@ -10,6 +10,30 @@ use crate::config::GlobalConfig;
 /// '3' => Autotune everything without anchor.
 static AUTOTUNE_LEVEL: AtomicI32 = AtomicI32::new(-1);
 
+#[cfg(feature = "std")]
+std::thread_local! {
+    // Only active while synchronously constructing one SDK key. Never spans an
+    // await or kernel execution, and never changes the global autotune level.
+    static SESSION_KEY: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+pub(crate) fn with_session_key<T>(generate: impl FnOnce() -> T) -> T {
+    #[cfg(feature = "std")]
+    {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                SESSION_KEY.set(self.0);
+            }
+        }
+        let _restore = Restore(SESSION_KEY.replace(true));
+        generate()
+    }
+    // Native SDK integrations enable std. Retain the existing no-std behavior.
+    #[cfg(not(feature = "std"))]
+    generate()
+}
+
 /// Anchor a number to a power of the provided base.
 ///
 /// Useful when creating autotune keys.
@@ -42,6 +66,10 @@ pub fn anchor(x: usize, max: Option<usize>, min: Option<usize>, base: Option<usi
 }
 
 fn load_autotune_level() -> u32 {
+    #[cfg(feature = "std")]
+    if SESSION_KEY.get() {
+        return 1; // Fixed balanced SDK key policy; autotuning still executes.
+    }
     let autotune_level = AUTOTUNE_LEVEL.load(Ordering::Relaxed);
     if autotune_level == -1 {
         let config = GlobalConfig::get();

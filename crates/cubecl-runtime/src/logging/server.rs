@@ -78,6 +78,16 @@ impl Default for ServerLogger {
 }
 
 impl ServerLogger {
+    /// Disable implicit profiling, detached log workers and file output for SDK clients.
+    /// Does not initialize or mutate dependency-global configuration.
+    pub fn disabled() -> Self {
+        Self {
+            profile_level: None,
+            log_compile_info: false,
+            log_channel: None,
+        }
+    }
+
     /// Returns the profile level, none if profiling is deactivated.
     pub fn profile_level(&self) -> Option<ProfileLevel> {
         self.profile_level

@@ -31,6 +31,52 @@ type Server = WgpuServer;
 static RUNTIME: ComputeRuntime<WgpuDevice, Server, MutexComputeChannel<Server>> =
     ComputeRuntime::new();
 
+impl WgpuRuntime {
+    /// Diagnostic snapshot of registered devices, including implicit defaults.
+    pub fn registered_device_count() -> usize {
+        RUNTIME.registered_client_count()
+    }
+
+    /// SDK registration with device-owned tuning tables and optional host persistence.
+    pub fn init_device_for_sdk(
+        setup: WgpuSetup,
+        options: RuntimeOptions,
+        tuning: std::sync::Arc<cubecl_runtime::tune::SessionTuning>,
+    ) -> WgpuDevice {
+        init_device_inner(setup, options, true, Some(tuning))
+    }
+
+    /// Run custom SDK wgpu pipeline creation on the same stable native compiler
+    /// thread as CubeCL. No captured resources are retained after the job returns.
+    #[cfg(target_os = "windows")]
+    pub fn with_stable_compiler<T: Send + 'static>(
+        operation: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        backend::compilation_worker::run(operation)
+    }
+    /// Register a Windows SDK device whose native pipeline creation uses one
+    /// process-lifetime compiler thread. The worker retains no idle GPU objects.
+    #[cfg(target_os = "windows")]
+    pub fn init_device_with_stable_compiler(
+        setup: WgpuSetup,
+        options: RuntimeOptions,
+    ) -> WgpuDevice {
+        init_device_inner(setup, options, true, None)
+    }
+    /// Retire an externally created device after all tensors, workers and GPU work are drained.
+    /// Does not destroy the host's wgpu device. Built-in/default registrations are not removed.
+    /// The retired ID must not be used again; initialize a new registration for a new session owner.
+    pub fn unregister_device(device: &WgpuDevice) -> bool {
+        if !matches!(device, WgpuDevice::Existing(_)) {
+            return false;
+        }
+        let client = RUNTIME.unregister(device);
+        let removed = client.is_some();
+        drop(client);
+        removed
+    }
+}
+
 impl Runtime for WgpuRuntime {
     type Compiler = AutoCompiler;
     type Server = WgpuServer;
@@ -165,6 +211,15 @@ pub struct WgpuSetup {
 /// This function generates a new, globally unique ID for the device every time it is called,
 /// even if called on the same device multiple times.
 pub fn init_device(setup: WgpuSetup, options: RuntimeOptions) -> WgpuDevice {
+    init_device_inner(setup, options, false, None)
+}
+
+fn init_device_inner(
+    setup: WgpuSetup,
+    options: RuntimeOptions,
+    stable_compiler: bool,
+    tuning: Option<std::sync::Arc<cubecl_runtime::tune::SessionTuning>>,
+) -> WgpuDevice {
     use core::sync::atomic::{AtomicU32, Ordering};
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -175,7 +230,7 @@ pub fn init_device(setup: WgpuSetup, options: RuntimeOptions) -> WgpuDevice {
     }
 
     let device_id = WgpuDevice::Existing(device_id);
-    let client = create_client_on_setup(setup, options);
+    let client = create_client_on_setup_inner(setup, options, stable_compiler, tuning);
     RUNTIME.register(&device_id, client);
     device_id
 }
@@ -210,6 +265,15 @@ pub async fn init_setup_async<G: GraphicsApi>(
 pub(crate) fn create_client_on_setup(
     setup: WgpuSetup,
     options: RuntimeOptions,
+) -> ComputeClient<WgpuServer, MutexComputeChannel<WgpuServer>> {
+    create_client_on_setup_inner(setup, options, false, None)
+}
+
+fn create_client_on_setup_inner(
+    setup: WgpuSetup,
+    options: RuntimeOptions,
+    stable_compiler: bool,
+    tuning: Option<std::sync::Arc<cubecl_runtime::tune::SessionTuning>>,
 ) -> ComputeClient<WgpuServer, MutexComputeChannel<WgpuServer>> {
     let limits = setup.device.limits();
     let adapter_limits = setup.adapter.limits();
@@ -262,7 +326,7 @@ pub(crate) fn create_client_on_setup(
     }
     backend::register_features(&setup.adapter, &mut device_props, &mut compilation_options);
 
-    let server = WgpuServer::new(
+    let mut server = WgpuServer::new(
         mem_props,
         options.memory_config,
         compilation_options,
@@ -271,6 +335,12 @@ pub(crate) fn create_client_on_setup(
         options.tasks_max,
         setup.backend,
     );
+    server.stable_compiler = stable_compiler;
+    if tuning.is_some() {
+        server.session_config = Some(std::sync::Arc::new(
+            cubecl_runtime::config::GlobalConfig::default(),
+        ));
+    }
     let channel = MutexComputeChannel::new(server);
 
     if features.contains(wgpu::Features::SHADER_FLOAT32_ATOMIC) {
@@ -280,7 +350,16 @@ pub(crate) fn create_client_on_setup(
         device_props.register_feature(Feature::AtomicFloat(AtomicFeature::Add));
     }
 
-    ComputeClient::new(channel, device_props, setup.backend)
+    match tuning {
+        Some(tuning) => ComputeClient::new_with_logger(
+            channel,
+            device_props,
+            setup.backend,
+            ServerLogger::disabled(),
+        )
+        .with_session_tuning(tuning),
+        None => ComputeClient::new(channel, device_props, setup.backend),
+    }
 }
 
 /// Select the wgpu device and queue based on the provided [device](WgpuDevice) and

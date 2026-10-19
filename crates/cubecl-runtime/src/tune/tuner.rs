@@ -87,6 +87,24 @@ impl<K: AutotuneKey> Tuner<K> {
         }
     }
 
+    pub(crate) fn new_for_session(name: &str, session: &super::SessionTuning) -> Self {
+        Self {
+            tune_cache: TuneCache::new_for_session(name, session),
+            logger: Logger::for_session(),
+            channel: async_channel::unbounded(),
+            autotuning: HashSet::new(),
+        }
+    }
+
+    pub(crate) fn fastest_for(&self, key: &K, operation_count: usize) -> TuneCacheResult {
+        match self.fastest(key) {
+            TuneCacheResult::Hit { fastest_index } if fastest_index >= operation_count => {
+                TuneCacheResult::Miss
+            }
+            result => result,
+        }
+    }
+
     /// Fetch the fastest autotune operation index for an autotune key.
     pub fn fastest(&self, key: &K) -> TuneCacheResult {
         self.tune_cache.fastest(key)

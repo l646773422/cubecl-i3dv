@@ -68,6 +68,13 @@ pub struct DebugInformation {
 static COMPILATION_LEVEL: AtomicI8 = AtomicI8::new(-1);
 
 fn compilation_level() -> u8 {
+    if let Some(config) = GlobalConfig::scoped() {
+        return match config.compilation.logger.level {
+            CompilationLogLevel::Full => 2,
+            CompilationLogLevel::Disabled => 0,
+            CompilationLogLevel::Basic => 1,
+        };
+    }
     let compilation_level = COMPILATION_LEVEL.load(Ordering::Relaxed);
     if compilation_level == -1 {
         let val = match GlobalConfig::get().compilation.logger.level {

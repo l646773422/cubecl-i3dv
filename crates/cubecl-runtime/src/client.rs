@@ -30,6 +30,7 @@ struct ComputeClientState<Server: ComputeServer> {
     properties: DeviceProperties<Server::Feature>,
     info: Server::Info,
     logger: Arc<ServerLogger>,
+    tuning: Option<Arc<crate::tune::SessionTuning>>,
     #[cfg(multi_threading)]
     current_profiling: spin::RwLock<Option<StreamId>>,
 }
@@ -64,11 +65,21 @@ where
         info: Server::Info,
     ) -> Self {
         let logger = ServerLogger::default();
+        Self::new_with_logger(channel, properties, info, logger)
+    }
 
+    /// Construct with an explicit logger without reading process-global settings.
+    pub fn new_with_logger(
+        channel: Channel,
+        properties: DeviceProperties<Server::Feature>,
+        info: Server::Info,
+        logger: ServerLogger,
+    ) -> Self {
         let state = ComputeClientState::new(
             properties,
             info,
             Arc::new(logger),
+            None,
             #[cfg(multi_threading)]
             spin::RwLock::new(None),
         );
@@ -77,6 +88,18 @@ where
             channel,
             state: Arc::new(state),
         }
+    }
+
+    /// Configure client-owned SDK tuning before cloning or registering the client.
+    pub fn with_session_tuning(mut self, tuning: Arc<crate::tune::SessionTuning>) -> Self {
+        Arc::get_mut(&mut self.state)
+            .expect("configure tuning before sharing client")
+            .tuning = Some(tuning);
+        self
+    }
+
+    pub fn session_tuning(&self) -> Option<&Arc<crate::tune::SessionTuning>> {
+        self.state.tuning.as_ref()
     }
 
     /// Given bindings, returns owned resources as bytes.

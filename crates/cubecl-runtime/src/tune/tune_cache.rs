@@ -50,7 +50,9 @@ pub(crate) struct PersistentCacheValue {
 pub(crate) struct TuneCache<K> {
     in_memory_cache: HashMap<K, CacheEntry>,
     #[cfg(std_io)]
-    persistent_cache: Cache<PersistentCacheKey<K>, PersistentCacheValue>,
+    persistent_cache: Option<Cache<PersistentCacheKey<K>, PersistentCacheValue>>,
+    #[cfg(std_io)]
+    managed: Option<ManagedCache<K>>,
 }
 
 /// Result of the cache try
@@ -80,10 +82,11 @@ impl<K: AutotuneKey> TuneCache<K> {
             let options = cubecl_common::cache::CacheOption::default();
             let mut cache = TuneCache {
                 in_memory_cache: HashMap::new(),
-                persistent_cache: Cache::new(
+                persistent_cache: Some(Cache::new(
                     format!("{device_id}/{name}"),
                     options.root(root).name("autotune"),
-                ),
+                )),
+                managed: None,
             };
             cache.load();
             cache
@@ -95,6 +98,44 @@ impl<K: AutotuneKey> TuneCache<K> {
                 in_memory_cache: HashMap::new(),
             }
         }
+    }
+
+    pub(crate) fn new_for_session(name: &str, session: &super::SessionTuning) -> Self {
+        #[cfg(not(std_io))]
+        let _ = (name, session);
+        #[allow(unused_mut)]
+        let mut cache = Self {
+            in_memory_cache: HashMap::new(),
+            #[cfg(std_io)]
+            persistent_cache: None,
+            #[cfg(std_io)]
+            managed: session.store.as_ref().map(|store| ManagedCache {
+                store: store.clone(),
+                namespace: name.into(),
+                entries: Vec::new(),
+            }),
+        };
+        #[cfg(std_io)]
+        if let Some(managed) = &mut cache.managed {
+            if let Some(bytes) = managed.store.read(&managed.namespace) {
+                if let Ok(entries) = serde_json::from_slice::<
+                    Vec<(PersistentCacheKey<K>, PersistentCacheValue)>,
+                >(&bytes)
+                {
+                    for (key, value) in &entries {
+                        cache.in_memory_cache.insert(
+                            key.key.clone(),
+                            CacheEntry::Done {
+                                checksum: ChecksumState::ToBeVerified(key.checksum.clone()),
+                                fastest_index: value.fastest_index,
+                            },
+                        );
+                    }
+                    managed.entries = entries;
+                }
+            }
+        }
+        cache
     }
 
     pub fn fastest(&self, key: &K) -> TuneCacheResult {
@@ -176,7 +217,24 @@ impl<K: AutotuneKey> TuneCache<K> {
         fastest_index: usize,
         results: Vec<Result<AutotuneOutcome, String>>,
     ) {
-        if let Err(err) = self.persistent_cache.insert(
+        if let Some(managed) = &mut self.managed {
+            managed.entries.retain(|(saved, _)| saved.key != key);
+            managed.entries.push((
+                PersistentCacheKey { key, checksum },
+                PersistentCacheValue {
+                    fastest_index,
+                    results,
+                },
+            ));
+            if let Ok(bytes) = serde_json::to_vec(&managed.entries) {
+                managed.store.write(&managed.namespace, &bytes);
+            }
+            return;
+        }
+        let Some(persistent_cache) = &mut self.persistent_cache else {
+            return;
+        };
+        if let Err(err) = persistent_cache.insert(
             PersistentCacheKey { key, checksum },
             PersistentCacheValue {
                 fastest_index,
@@ -205,7 +263,10 @@ impl<K: AutotuneKey> TuneCache<K> {
     pub(crate) fn load(&mut self) {
         log::info!("Load autotune cache ...");
         let mut loaded = 0;
-        self.persistent_cache.for_each(|key, value| {
+        let Some(persistent_cache) = &mut self.persistent_cache else {
+            return;
+        };
+        persistent_cache.for_each(|key, value| {
             loaded += 1;
             self.in_memory_cache.insert(
                 key.key.clone(),
@@ -217,4 +278,12 @@ impl<K: AutotuneKey> TuneCache<K> {
         });
         log::info!("Loaded {loaded} autotune cached entries");
     }
+}
+
+#[cfg(std_io)]
+#[derive(Debug)]
+struct ManagedCache<K> {
+    store: alloc::sync::Arc<dyn super::AutotuneStore>,
+    namespace: String,
+    entries: Vec<(PersistentCacheKey<K>, PersistentCacheValue)>,
 }

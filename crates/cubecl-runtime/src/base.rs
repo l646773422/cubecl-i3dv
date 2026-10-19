@@ -74,6 +74,22 @@ where
         Self::register_inner(device, client, &mut clients);
     }
 
+    /// Remove a device registration after its owner has stopped all producers.
+    /// Existing client clones retain their resources until they are dropped.
+    /// Drop the returned client outside the registry lock.
+    pub fn unregister(&self, device: &Device) -> Option<ComputeClient<Server, Channel>> {
+        self.clients
+            .lock()
+            .as_mut()
+            .and_then(|clients| clients.remove(device))
+    }
+
+    /// Number of registered clients, without initializing the runtime.
+    /// This is a diagnostic snapshot; concurrent registrations may change it.
+    pub fn registered_client_count(&self) -> usize {
+        self.clients.lock().as_ref().map_or(0, HashMap::len)
+    }
+
     fn register_inner(
         device: &Device,
         client: ComputeClient<Server, Channel>,
